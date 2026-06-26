@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/dapr/dapr/pkg/actors/api"
 	placementfake "github.com/dapr/dapr/pkg/actors/internal/placement/fake"
 	"github.com/dapr/dapr/pkg/actors/internal/reentrancystore"
+	timersfake "github.com/dapr/dapr/pkg/actors/internal/timers/fake"
 	"github.com/dapr/dapr/pkg/channel/fake"
 	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
 	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
@@ -134,6 +136,106 @@ func Test_HaltNonHosted(t *testing.T) {
 		return pl.IsActorHosted(t.Context(), r.ActorType, r.ActorID)
 	}))
 	assert.Equal(t, 4, mapLen(ff))
+}
+
+// Actors rebalanced off this host (HaltNonHosted) have their timers dropped
+// from the local store.
+func Test_HaltNonHosted_DeletesTimers(t *testing.T) {
+	hosted := map[string]bool{
+		"foo1": true,
+		"foo2": true,
+		"foo5": true,
+		"foo7": true,
+	}
+
+	pl := placementfake.New().WithIsActorHosted(func(_ context.Context, _, actorID string) bool {
+		return hosted[actorID]
+	})
+
+	var deleted []string
+	timerStorage := timersfake.New().WithDeleteForActorsFn(func(_ context.Context, _ string, actorIDs []string) {
+		deleted = append(deleted, actorIDs...)
+	})
+
+	fact := New(Options{
+		Reentrancy:   reentrancystore.New(),
+		Placement:    pl,
+		IdleTimeout:  time.Second * 10,
+		TimerStorage: timerStorage,
+		AppChannel: fake.New().WithInvokeMethod(func(context.Context, *invokev1.InvokeMethodRequest, string) (*invokev1.InvokeMethodResponse, error) {
+			return invokev1.NewInvokeMethodResponse(http.StatusOK, "", nil), nil
+		}),
+	})
+
+	for i := 1; i <= 7; i++ {
+		fact.GetOrCreate("foo" + strconv.Itoa(i))
+	}
+
+	require.NoError(t, fact.HaltNonHosted(t.Context(), func(r *api.LookupActorRequest) bool {
+		return pl.IsActorHosted(t.Context(), r.ActorType, r.ActorID)
+	}))
+
+	// Only the non-hosted actors should have had their timers removed.
+	assert.ElementsMatch(t, []string{"foo3", "foo4", "foo6"}, deleted)
+}
+
+// HaltAll (e.g. actor type unregistered or host draining) must also drop the
+// timers of every actor it halts.
+func Test_HaltAll_DeletesTimers(t *testing.T) {
+	var deleted []string
+	timerStorage := timersfake.New().WithDeleteForActorsFn(func(_ context.Context, _ string, actorIDs []string) {
+		deleted = append(deleted, actorIDs...)
+	})
+
+	fact := New(Options{
+		Reentrancy:   reentrancystore.New(),
+		Placement:    placementfake.New(),
+		IdleTimeout:  time.Second * 10,
+		TimerStorage: timerStorage,
+		AppChannel: fake.New().WithInvokeMethod(func(context.Context, *invokev1.InvokeMethodRequest, string) (*invokev1.InvokeMethodResponse, error) {
+			return invokev1.NewInvokeMethodResponse(http.StatusOK, "", nil), nil
+		}),
+	})
+
+	for i := 1; i <= 3; i++ {
+		fact.GetOrCreate("foo" + strconv.Itoa(i))
+	}
+
+	require.NoError(t, fact.HaltAll(t.Context()))
+	assert.ElementsMatch(t, []string{"foo1", "foo2", "foo3"}, deleted)
+}
+
+// Idle deactivation must NOT delete timers: a timer should be able to
+// reactivate an idle actor that is still hosted locally.
+func Test_Idle_KeepsTimers(t *testing.T) {
+	clock := clocktesting.NewFakeClock(time.Now())
+
+	var deleteCalled atomic.Bool
+	timerStorage := timersfake.New().WithDeleteForActorsFn(func(context.Context, string, []string) {
+		deleteCalled.Store(true)
+	})
+
+	fact := New(Options{
+		Reentrancy:   reentrancystore.New(),
+		clock:        clock,
+		Placement:    placementfake.New(),
+		IdleTimeout:  time.Second * 10,
+		TimerStorage: timerStorage,
+		AppChannel: fake.New().WithInvokeMethod(func(context.Context, *invokev1.InvokeMethodRequest, string) (*invokev1.InvokeMethodResponse, error) {
+			return invokev1.NewInvokeMethodResponse(http.StatusOK, "", nil), nil
+		}),
+	})
+	ff := fact.(*factory)
+
+	fact.GetOrCreate("foo1")
+	fact.GetOrCreate("foo2")
+	assert.Equal(t, 2, mapLen(ff))
+
+	assert.Eventually(t, clock.HasWaiters, time.Second*10, time.Millisecond*10)
+	clock.Step(time.Second * 10)
+	assert.Eventually(t, func() bool { return mapLen(ff) == 0 }, time.Second*10, time.Millisecond*10)
+
+	assert.False(t, deleteCalled.Load(), "idle deactivation must not delete timers")
 }
 
 func Test_Idle(t *testing.T) {

@@ -24,6 +24,7 @@ import (
 	"github.com/dapr/dapr/pkg/actors/api"
 	"github.com/dapr/dapr/pkg/actors/internal/placement"
 	"github.com/dapr/dapr/pkg/actors/internal/reentrancystore"
+	internaltimers "github.com/dapr/dapr/pkg/actors/internal/timers"
 	"github.com/dapr/dapr/pkg/actors/targets"
 	"github.com/dapr/dapr/pkg/actors/targets/app/lock"
 	"github.com/dapr/dapr/pkg/actors/targets/app/transport"
@@ -45,6 +46,7 @@ type Options struct {
 	clock        clock.Clock
 	Reentrancy   *reentrancystore.Store
 	Placement    placement.Interface
+	TimerStorage internaltimers.Storage
 	EntityConfig *api.EntityConfig
 }
 
@@ -56,6 +58,7 @@ type factory struct {
 	reentrancy   *reentrancystore.Store
 	clock        clock.Clock
 	placement    placement.Interface
+	timerStorage internaltimers.Storage
 	entityConfig *api.EntityConfig
 
 	// idleTimeout is the configured max idle time for actors of this kind.
@@ -78,6 +81,7 @@ func New(opts Options) targets.Factory {
 		clock:        opts.clock,
 		idleTimeout:  opts.IdleTimeout,
 		reentrancy:   opts.Reentrancy,
+		timerStorage: opts.TimerStorage,
 		entityConfig: opts.EntityConfig,
 	}
 
@@ -158,6 +162,7 @@ func (f *factory) HaltNonHosted(ctx context.Context, fn func(*api.LookupActorReq
 func (f *factory) haltActors(ctx context.Context, fn func(string) bool) error {
 	var wg sync.WaitGroup
 	errs := slice.New[error]()
+	var halted []string
 
 	f.table.Range(func(key, a any) bool {
 		aa := a.(*app)
@@ -166,6 +171,7 @@ func (f *factory) haltActors(ctx context.Context, fn func(string) bool) error {
 			return true
 		}
 
+		halted = append(halted, aa.actorID)
 		wg.Add(1)
 		go func(aa *app) {
 			defer wg.Done()
@@ -176,6 +182,14 @@ func (f *factory) haltActors(ctx context.Context, fn func(string) bool) error {
 	})
 
 	wg.Wait()
+
+	// Actors halted here are no longer hosted on this host (rebalanced away or
+	// their type unregistered), so drop any timers they left in the local
+	// in-memory store. Idle deactivation goes through handleIdleActor, not here,
+	// so an idle but still-hosted actor keeps its timers.
+	if f.timerStorage != nil && len(halted) > 0 {
+		f.timerStorage.DeleteForActors(ctx, f.actorType, halted)
+	}
 
 	return errors.Join(errs.Slice()...)
 }

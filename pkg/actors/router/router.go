@@ -43,6 +43,12 @@ import (
 	"github.com/dapr/dapr/pkg/resiliency"
 )
 
+// ErrTimerActorMoved is returned when a timer fires for an actor that is no
+// longer hosted on this instance. Timers are host-local and not durable, so the
+// timer is dropped here rather than routed cross-host (which is what reminders
+// are for).
+var ErrTimerActorMoved = errors.New("actor no longer hosted locally, dropping timer")
+
 type Interface interface {
 	Run(ctx context.Context) error
 	Call(ctx context.Context, req *internalv1pb.InternalInvokeRequest) (*internalv1pb.InternalInvokeResponse, error)
@@ -198,6 +204,13 @@ func (r *router) callReminder(ctx context.Context, req *api.Reminder) error {
 	if !lar.Local {
 		if req.IsRemote {
 			return backoff.Permanent(errors.New("remote actor moved"))
+		}
+
+		// Timers are host-local and not durable. Once the actor has moved off
+		// this host the timer is dropped here instead of being routed
+		// cross-host; only reminders follow the actor.
+		if req.IsTimer {
+			return backoff.Permanent(ErrTimerActorMoved)
 		}
 
 		err = r.callRemoteActorReminder(ctx, lar, req)

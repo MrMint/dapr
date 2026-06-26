@@ -15,6 +15,7 @@ package inmemory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"sync"
@@ -73,6 +74,17 @@ func (i *inmemory) Close() error {
 // processorExecuteFn is invoked when the processor executes a reminder.
 func (i *inmemory) processorExecuteFn(reminder *api.Reminder) {
 	err := i.router.CallReminder(context.TODO(), reminder)
+
+	// The actor has been rebalanced off this host. Timers do not follow the
+	// actor, so the timer is removed rather than fired again.
+	if errors.Is(err, router.ErrTimerActorMoved) {
+		log.Debugf("Actor for timer %s no longer hosted locally, removing timer", reminder.Key())
+		if i.activeTimers.CompareAndDelete(reminder.Key(), reminder) {
+			i.updateActiveTimersCount(reminder.ActorType, -1)
+		}
+		return
+	}
+
 	diag.DefaultMonitoring.ActorTimerFired(reminder.ActorType, err == nil)
 	if err != nil {
 		// Successful and non-successful executions are treated as the same in
@@ -98,8 +110,13 @@ func (i *inmemory) processorExecuteFn(reminder *api.Reminder) {
 		return
 	}
 
-	// Re-enqueue the timer for its next repetition
-	i.processor.Enqueue(reminder)
+	// Re-enqueue for the next tick, unless the timer is no longer active. The
+	// processor pops the item before executing it, so a concurrent delete cannot
+	// remove this in-flight one from the queue; the check here keeps a deleted
+	// timer from being re-added.
+	if _, ok := i.activeTimers.Load(reminder.Key()); ok {
+		i.processor.Enqueue(reminder)
+	}
 }
 
 func (i *inmemory) Create(ctx context.Context, reminder *api.Reminder) error {
@@ -164,6 +181,35 @@ func (i *inmemory) Delete(_ context.Context, timerKey string) {
 		i.updateActiveTimersCount(reminder.ActorType, -1)
 		i.processor.Dequeue(reminder.Key())
 	}
+}
+
+// DeleteForActors removes every timer belonging to any of the given actors of
+// the given type, in a single pass over the timer set. An actor may hold
+// multiple timers (keyed by name), so all of them are dropped.
+func (i *inmemory) DeleteForActors(_ context.Context, actorType string, actorIDs []string) {
+	if len(actorIDs) == 0 {
+		return
+	}
+
+	ids := make(map[string]struct{}, len(actorIDs))
+	for _, id := range actorIDs {
+		ids[id] = struct{}{}
+	}
+
+	i.activeTimers.Range(func(_, value any) bool {
+		reminder := value.(*api.Reminder)
+		if reminder.ActorType != actorType {
+			return true
+		}
+		if _, ok := ids[reminder.ActorID]; !ok {
+			return true
+		}
+		if i.activeTimers.CompareAndDelete(reminder.Key(), reminder) {
+			i.updateActiveTimersCount(reminder.ActorType, -1)
+			i.processor.Dequeue(reminder.Key())
+		}
+		return true
+	})
 }
 
 func (i *inmemory) updateActiveTimersCount(actorType string, inc int64) {

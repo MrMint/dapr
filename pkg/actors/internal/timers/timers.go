@@ -24,4 +24,8 @@ type Storage interface {
 	io.Closer
 	Create(ctx context.Context, reminder *api.Reminder) error
 	Delete(ctx context.Context, timerKey string)
+	// DeleteForActors removes every timer belonging to any of the given actors.
+	// Called when those actors are no longer hosted on this host (rebalanced
+	// away or their type unregistered).
+	DeleteForActors(ctx context.Context, actorType string, actorIDs []string)
 }
